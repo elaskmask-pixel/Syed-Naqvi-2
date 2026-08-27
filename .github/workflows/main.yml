@@ -1,4 +1,4 @@
-name: Enable RDP on Windows targets via Tailscale (single-file, default 10 hours)
+name: RDP (enable for configurable hours, default 10)
 
 on:
   workflow_dispatch:
@@ -9,378 +9,123 @@ on:
         default: '10'
 
 jobs:
-  enable-rdp:
+  secure-rdp:
     runs-on: windows-latest
+    # allow a bit of buffer above requested hours (10h = 600m). Set to 660 (11h).
+    timeout-minutes: 660
     env:
       HOURS: ${{ github.event.inputs.hours }}
-      REMOTE_USER: 'Administrator'
-      REMOTE_PASS: ${{ secrets.REMOTE_PASS }}
-      TARGETS: ${{ secrets.TARGETS }}
+      # Provide your Tailscale auth key as repo secret TAILSCALE_AUTHKEY
       TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-      WINRM_USE_SSL: ${{ secrets.WINRM_USE_SSL }}
-      WINRM_SKIPCERT: ${{ secrets.WINRM_SKIPCERT }}
+      # TARGETS secret not needed for this runner-based approach (we advertise runner's Tailscale IP)
+      # Create/Use Windows local user "RDP" with generated password; password is written to GITHUB_ENV
     steps:
-      - name: Checkout repo
+      - name: Checkout (not required, but convenient)
         uses: actions/checkout@v4
 
-      - name: Install Tailscale on runner
+      - name: Configure Core RDP Settings (enable)
+        shell: pwsh
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          # (Optional) allow less strict auth for compatibility
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          # Replace any existing rule with same name
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || $null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with secure random password
+        shell: pwsh
+        run: |
+          # generate a reasonably strong password (12+ chars)
+          $chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{};:,.<>?"
+          $password = -join ((1..16) | ForEach-Object { $chars | Get-Random -Count 1 })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            # if user exists, set new password
+            Set-LocalUser -Name "RDP" -Password $securePass
+          } else {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction Stop
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          # Export credentials for later display in workflow log (written to GITHUB_ENV)
+          # NOTE: this will put the password in the workflow logs/environment — keep repo private and protect access.
+          "RDP_USER=RDP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          ("RDP_PASS=" + $password) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Tailscale
         shell: pwsh
         run: |
           choco install tailscale -y
           Start-Sleep -Seconds 2
           if (Get-Service -Name tailscaled -ErrorAction SilentlyContinue) { Start-Service tailscaled -ErrorAction SilentlyContinue } elseif (Get-Service -Name Tailscale -ErrorAction SilentlyContinue) { Start-Service Tailscale -ErrorAction SilentlyContinue }
 
-      - name: Join tailnet (runner)
+      - name: Bring up Tailscale (runner joins your tailnet)
         shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           if (-not $env:TAILSCALE_AUTHKEY) { throw "Set repo secret TAILSCALE_AUTHKEY" }
-          tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname "gha-runner-${{ github.run_id }}" --accept-dns --accept-routes || tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname "gha-runner-${{ github.run_id }}" || throw "tailscale up failed"
+          # Start tailscale and join
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="$env:TAILSCALE_AUTHKEY" --hostname "gha-runner-${{ github.run_id }}" --accept-dns --accept-routes || & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="$env:TAILSCALE_AUTHKEY" --hostname "gha-runner-${{ github.run_id }}" || throw "tailscale up failed"
           Start-Sleep -Seconds 5
-          tailscale status
+          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          if (-not $ip) { throw "No Tailscale IPv4 assigned" }
+          # write to env for later steps
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Create EnableRDP script on runner
+      - name: Verify RDP Accessibility (simple check)
         shell: pwsh
         run: |
-          $script = @'
-param(
-    [int]$Hours = 10,
-    [string]$TaskName = "DisableRDP_Auto"
-)
-
-try {
-    Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Type DWord -ErrorAction Stop
-} catch {
-    Write-Warning "Registry set failed: $_"
-    throw
-}
-
-try {
-    Set-Service -Name TermService -StartupType Automatic -ErrorAction Stop
-    Start-Service -Name TermService -ErrorAction Stop
-} catch {
-    Write-Warning "TermService start failed: $_"
-}
-
-try {
-    Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop
-} catch {
-    if (-not (Get-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -ErrorAction SilentlyContinue)) {
-        New-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -Profile Any -ErrorAction Stop
-    } else {
-        Enable-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -ErrorAction SilentlyContinue
-    }
-}
-
-$disableCmd = "Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1; Get-NetFirewallRule -DisplayGroup 'Remote Desktop' | Disable-NetFirewallRule; if (Get-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -ErrorAction SilentlyContinue) { Disable-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' }"
-
-try {
-    $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -WindowStyle Hidden -Command `"${disableCmd}`""
-    $at = (Get-Date).AddHours($Hours)
-    $trigger = New-ScheduledTaskTrigger -Once -At $at
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue }
-    Register-ScheduledTask -TaskName $TaskName -Trigger $trigger -Action $action -RunLevel Highest -ErrorAction Stop
-} catch {
-    Write-Warning "Scheduling disable failed: $_"
-    $timeStr = $at.ToString("HH:mm")
-    $dateStr = $at.ToString("MM/dd/yyyy")
-    $cmd = "schtasks /Create /SC ONCE /TN `"$TaskName`" /TR `"powershell -NoProfile -WindowStyle Hidden -Command `"${disableCmd}`"`" /ST $timeStr /SD $dateStr /RL HIGHEST /F"
-    Invoke-Expression $cmd
-}
-
-Write-Output "RDP enabled for $Hours hour(s)."
-'@
-
-          Set-Content -Path EnableRDP_10h.ps1 -Value $script -Force -Encoding UTF8
-
-      - name: Run EnableRDP_10h on each target via WinRM over Tailscale
-        shell: pwsh
-        env:
-          HOURS: ${{ env.HOURS }}
-          TARGETS: ${{ env.TARGETS }}
-          REMOTE_PASS: ${{ env.REMOTE_PASS }}
-          WINRM_USE_SSL: ${{ env.WINRM_USE_SSL }}
-          WINRM_SKIPCERT: ${{ env.WINRM_SKIPCERT }}
-        run: |
-          if (-not $env:TARGETS) { throw "Set repo secret TARGETS" }
-          $targets = ($env:TARGETS -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-          $securePass = ConvertTo-SecureString $env:REMOTE_PASS -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential ('Administrator', $securePass)
-
-          $so = $null
-          if ($env:WINRM_SKIPCERT -eq 'true') { $so = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck -OperationTimeout 180000 }
-
-          foreach ($t in $targets) {
-            Write-Output "Processing $t"
-            try {
-              if ($so) {
-                $s = New-PSSession -ComputerName $t -Credential $cred -UseSSL ($env:WINRM_USE_SSL -eq 'true') -SessionOption $so -ErrorAction Stop
-              } else {
-                if ($env:WINRM_USE_SSL -eq 'true') { $s = New-PSSession -ComputerName $t -Credential $cred -UseSSL -ErrorAction Stop } else { $s = New-PSSession -ComputerName $t -Credential $cred -ErrorAction Stop }
-              }
-              Copy-Item -ToSession $s -Path .\EnableRDP_10h.ps1 -Destination "C:\Windows\Temp\EnableRDP_10h.ps1" -Force -ErrorAction Stop
-              Invoke-Command -Session $s -ScriptBlock { param($p,$h) & $p $h } -ArgumentList "C:\Windows\Temp\EnableRDP_10h.ps1", $env:HOURS -ErrorAction Stop
-              Invoke-Command -Session $s -ScriptBlock { Remove-Item -Path "C:\Windows\Temp\EnableRDP_10h.ps1" -ErrorAction SilentlyContinue }
-              Remove-PSSession -Session $s
-              Write-Output "Success for $t"
-            } catch {
-              Write-Warning "Failed for $t : $_"
-            }
-          }          tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname "gha-runner-${{ github.run_id }}" --accept-dns --accept-routes || tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname "gha-runner-${{ github.run_id }}" || throw "tailscale up failed"
-          Start-Sleep -Seconds 5
-          tailscale status
-
-      - name: Create embedded EnableRDP script on runner
-        shell: pwsh
-        run: |
-          $script = @'
-param(
-    [int]$Hours = 10,
-    [string]$TaskName = "DisableRDP_Auto"
-)
-
-try {
-    Write-Output "Enabling Remote Desktop (registry)..."
-    Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Type DWord -ErrorAction Stop
-} catch {
-    Write-Warning "Failed to set registry key to enable RDP: $_"
-    throw
-}
-
-try {
-    Write-Output "Setting TermService to Automatic and starting service..."
-    Set-Service -Name TermService -StartupType Automatic -ErrorAction Stop
-    Start-Service -Name TermService -ErrorAction Stop
-} catch {
-    Write-Warning "Could not start or set TermService: $_"
-}
-
-try {
-    Write-Output "Enabling built-in Remote Desktop firewall rules..."
-    Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop
-} catch {
-    Write-Warning "Could not enable 'Remote Desktop' firewall group. Creating/Enabling rule for TCP/3389..."
-    try {
-        if (-not (Get-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -Profile Any -ErrorAction Stop
-            Write-Output "Firewall rule 'Allow RDP TCP 3389' created."
-        } else {
-            Enable-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -ErrorAction SilentlyContinue
-        }
-    } catch {
-        Write-Warning "Failed to create or enable firewall rule for TCP/3389: $_"
-    }
-}
-
-$disableCmd = "Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1; Get-NetFirewallRule -DisplayGroup 'Remote Desktop' | Disable-NetFirewallRule; if (Get-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -ErrorAction SilentlyContinue) { Disable-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' }"
-
-# Create scheduled task to disable RDP after $Hours
-try {
-    $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -WindowStyle Hidden -Command `"${disableCmd}`""
-    $at = (Get-Date).AddHours($Hours)
-    $trigger = New-ScheduledTaskTrigger -Once -At $at
-
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    }
-
-    Register-ScheduledTask -TaskName $TaskName -Trigger $trigger -Action $action -RunLevel Highest -ErrorAction Stop
-    Write-Output "Scheduled task '$TaskName' registered to run at $at and will disable RDP then."
-} catch {
-    Write-Warning "Failed to register scheduled task: $_"
-    try {
-        $timeStr = $at.ToString("HH:mm")
-        $dateStr = $at.ToString("MM/dd/yyyy")
-        $cmd = "schtasks /Create /SC ONCE /TN `"$TaskName`" /TR `"powershell -NoProfile -WindowStyle Hidden -Command `"${disableCmd}`"`" /ST $timeStr /SD $dateStr /RL HIGHEST /F"
-        Invoke-Expression $cmd
-        Write-Output "schtasks entry created for $dateStr $timeStr"
-    } catch {
-        Write-Error "Failed to create fallback schtasks entry: $_"
-    }
-}
-
-Write-Output "RDP enabled for $Hours hour(s). To cancel scheduled disable before it runs:"
-Write-Output "  Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false"
-'@
-
-          Set-Content -Path EnableRDP_10h.ps1 -Value $script -Force -Encoding UTF8
-          Get-Item EnableRDP_10h.ps1
-
-      - name: Run EnableRDP_10h on each target over WinRM via Tailscale
-        shell: pwsh
-        env:
-          HOURS: ${{ env.HOURS }}
-          TARGETS: ${{ env.TARGETS }}
-          REMOTE_PASS: ${{ env.REMOTE_PASS }}
-          WINRM_USE_SSL: ${{ env.WINRM_USE_SSL }}
-          WINRM_SKIPCERT: ${{ env.WINRM_SKIPCERT }}
-        run: |
-          # Ensure remote username default
-          if (-not $env:REMOTE_USER) { $env:REMOTE_USER = 'Administrator' }
-          Write-Output "Using remote username: $env:REMOTE_USER"
-
-          if (-not $env:TARGETS) { throw "Set repo secret TARGETS as comma-separated Tailscale IPs (e.g. 100.x.x.10,100.x.x.11)" }
-          $targets = ($env:TARGETS -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-          if ($targets.Count -eq 0) { throw "Targets list empty" }
-
-          $securePass = ConvertTo-SecureString $env:REMOTE_PASS -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential ($env:REMOTE_USER, $securePass)
-
-          $so = $null
-          if ($env:WINRM_SKIPCERT -eq 'true') {
-            $so = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck -OperationTimeout 180000
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $test.TcpTestSucceeded) {
+            Write-Warning "TCP test to 3389 failed (may still be fine if service not yet ready)"
+          } else {
+            Write-Host "TCP 3389 reachable on $env:TAILSCALE_IP"
           }
 
-          foreach ($t in $targets) {
-            Write-Output "---- Processing $t ----"
-            try {
-              if ($so) {
-                $s = New-PSSession -ComputerName $t -Credential $cred -UseSSL ($env:WINRM_USE_SSL -eq 'true') -SessionOption $so -ErrorAction Stop
-              } else {
-                if ($env:WINRM_USE_SSL -eq 'true') {
-                  $s = New-PSSession -ComputerName $t -Credential $cred -UseSSL -ErrorAction Stop
-                } else {
-                  $s = New-PSSession -ComputerName $t -Credential $cred -ErrorAction Stop
-                }
-              }
-
-              $remotePath = "C:\Windows\Temp\EnableRDP_10h.ps1"
-              Copy-Item -ToSession $s -Path .\EnableRDP_10h.ps1 -Destination $remotePath -Force -ErrorAction Stop
-
-              Invoke-Command -Session $s -ScriptBlock { param($p,$h) & $p $h } -ArgumentList $remotePath, $env:HOURS -ErrorAction Stop
-
-              Invoke-Command -Session $s -ScriptBlock { param($p) Remove-Item -Path $p -ErrorAction SilentlyContinue } -ArgumentList $remotePath
-
-              Remove-PSSession -Session $s
-              Write-Output "Success for $t"
-            } catch {
-              Write-Warning "Failed for $t : $_"
-            }
-          }          tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname "gha-runner-${{ github.run_id }}" --accept-dns --accept-routes || tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname "gha-runner-${{ github.run_id }}" || throw "tailscale up failed"
-          Start-Sleep -Seconds 5
-          tailscale status
-
-      - name: Write EnableRDP_10h.ps1 on runner
+      - name: Maintain connection for requested hours then cleanup (default 10)
         shell: pwsh
         run: |
-          $script = @'
-param(
-    [int]$Hours = 10,
-    [string]$TaskName = "DisableRDP_Auto"
-)
-
-try {
-    Write-Output "Enabling Remote Desktop (registry)..."
-    Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Type DWord -ErrorAction Stop
-} catch {
-    Write-Warning "Failed to set registry key to enable RDP: $_"
-    throw
-}
-
-try {
-    Write-Output "Setting TermService to Automatic and starting service..."
-    Set-Service -Name TermService -StartupType Automatic -ErrorAction Stop
-    Start-Service -Name TermService -ErrorAction Stop
-} catch {
-    Write-Warning "Could not start or set TermService: $_"
-}
-
-try {
-    Write-Output "Enabling built-in Remote Desktop firewall rules..."
-    Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction Stop
-} catch {
-    Write-Warning "Could not enable 'Remote Desktop' firewall group. Creating/Enabling rule for TCP/3389..."
-    try {
-        if (-not (Get-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -Profile Any -ErrorAction Stop
-            Write-Output "Firewall rule 'Allow RDP TCP 3389' created."
-        } else {
-            Enable-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -ErrorAction SilentlyContinue
-        }
-    } catch {
-        Write-Warning "Failed to create or enable firewall rule for TCP/3389: $_"
-    }
-}
-
-$disableCmd = "Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1; Get-NetFirewallRule -DisplayGroup 'Remote Desktop' | Disable-NetFirewallRule; if (Get-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -ErrorAction SilentlyContinue) { Disable-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' }"
-
-# Create scheduled task to disable RDP after $Hours
-try {
-    $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -WindowStyle Hidden -Command `"${disableCmd}`""
-    $at = (Get-Date).AddHours($Hours)
-    $trigger = New-ScheduledTaskTrigger -Once -At $at
-
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    }
-
-    Register-ScheduledTask -TaskName $TaskName -Trigger $trigger -Action $action -RunLevel Highest -ErrorAction Stop
-    Write-Output "Scheduled task '$TaskName' registered to run at $at and will disable RDP then."
-} catch {
-    Write-Warning "Failed to register scheduled task: $_"
-    try {
-        $timeStr = $at.ToString("HH:mm")
-        $dateStr = $at.ToString("MM/dd/yyyy")
-        $cmd = "schtasks /Create /SC ONCE /TN `"$TaskName`" /TR `"powershell -NoProfile -WindowStyle Hidden -Command `"${disableCmd}`"`" /ST $timeStr /SD $dateStr /RL HIGHEST /F"
-        Invoke-Expression $cmd
-        Write-Output "schtasks entry created for $dateStr $timeStr"
-    } catch {
-        Write-Error "Failed to create fallback schtasks entry: $_"
-    }
-}
-
-Write-Output "RDP enabled for $Hours hour(s). To cancel scheduled disable before it runs:"
-Write-Output "  Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false"
-'@
-
-          Set-Content -Path EnableRDP_10h.ps1 -Value $script -Force -Encoding UTF8
-          Get-Item EnableRDP_10h.ps1
-
-      - name: Run EnableRDP_10h on each target over WinRM via Tailscale
-        shell: pwsh
-        env:
-          HOURS: ${{ env.HOURS }}
-          TARGETS: ${{ env.TARGETS }}
-          REMOTE_USER: ${{ env.REMOTE_USER }}
-          REMOTE_PASS: ${{ env.REMOTE_PASS }}
-          WINRM_USE_SSL: ${{ env.WINRM_USE_SSL }}
-          WINRM_SKIPCERT: ${{ env.WINRM_SKIPCERT }}
-        run: |
-          if (-not $env:TARGETS) { throw "Set repo secret TARGETS as comma-separated Tailscale IPs (e.g. 100.x.x.10,100.x.x.11)" }
-          $targets = ($env:TARGETS -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-          if ($targets.Count -eq 0) { throw "Targets list empty" }
-
-          $securePass = ConvertTo-SecureString $env:REMOTE_PASS -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential ($env:REMOTE_USER, $securePass)
-
-          # Optional session option for SSL/self-signed
-          $so = $null
-          if ($env:WINRM_SKIPCERT -eq 'true') {
-            $so = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck -OperationTimeout 180000
+          $hours = [int]($env:HOURS)
+          if ($hours -lt 1) { $hours = 10 }
+          $end = (Get-Date).AddHours($hours)
+          Write-Host "Keeping RDP enabled until $end (for $hours hour(s))"
+          while ((Get-Date) -lt $end) {
+            $remaining = $end - (Get-Date)
+            Write-Host ("[{0}] RDP active. Time left: {1}" -f (Get-Date), $remaining.ToString())
+            Start-Sleep -Seconds 60
           }
 
-          foreach ($t in $targets) {
-            Write-Output "---- Processing $t ----"
-            try {
-              if ($so) {
-                $s = New-PSSession -ComputerName $t -Credential $cred -UseSSL ($env:WINRM_USE_SSL -eq 'true') -SessionOption $so -ErrorAction Stop
-              } else {
-                if ($env:WINRM_USE_SSL -eq 'true') {
-                  $s = New-PSSession -ComputerName $t -Credential $cred -UseSSL -ErrorAction Stop
-                } else {
-                  $s = New-PSSession -ComputerName $t -Credential $cred -ErrorAction Stop
-                }
-              }
+          Write-Host "Time elapsed — running cleanup to disable RDP and remove firewall rule."
 
-              $remotePath = "C:\Windows\Temp\EnableRDP_10h.ps1"
-              Copy-Item -ToSession $s -Path .\EnableRDP_10h.ps1 -Destination $remotePath -Force -ErrorAction Stop
-
-              Invoke-Command -Session $s -ScriptBlock { param($p,$h) & $p $h } -ArgumentList $remotePath, $env:HOURS -ErrorAction Stop
-
-              Invoke-Command -Session $s -ScriptBlock { param($p) Remove-Item -Path $p -ErrorAction SilentlyContinue } -ArgumentList $remotePath
-
-              Remove-PSSession -Session $s
-              Write-Output "Success for $t"
-            } catch {
-              Write-Warning "Failed for $t : $_"
+          try {
+            # Disable Remote Desktop
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 1 -Force
+            # Remove firewall rule we added
+            netsh advfirewall firewall delete rule name="RDP-Tailscale" || $null
+            # (Optional) remove the local user created earlier
+            if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              # Remove from groups first
+              Try { Remove-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue } Catch {}
+              Try { Remove-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue } Catch {}
+              # Then remove user
+              Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
             }
+          } catch {
+            Write-Warning "Cleanup encountered an error: $_"
           }
+
+          Write-Host "Cleanup finished. RDP disabled."
+      - name: Show connection info (end)
+        shell: pwsh
+        run: |
+          Write-Host "If you saved credentials, view them in Actions run artifacts or environment (if set)."
+          Write-Host "Note: If runner timed out earlier because of account limits, consider using a self-hosted runner."
