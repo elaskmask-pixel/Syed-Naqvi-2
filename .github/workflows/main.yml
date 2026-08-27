@@ -11,20 +11,20 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 660   # 11 hours to allow time for cleanup
+    timeout-minutes: 660   # 11 hours to allow cleanup after 10h
     env:
       HOURS: ${{ github.event.inputs.hours }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
     steps:
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
-          # Enable Remote Desktop and (optionally) relax NLA/SecurityLayer for testing
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
-
-          # Remove any existing rule with same name and add rule for RDP
           netsh advfirewall firewall delete rule name="RDP-Tailscale" || $null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
@@ -46,25 +46,15 @@ jobs:
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
           if (-not (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name 'RDP' -Password $securePass -AccountNeverExpires -Description "Temporary RDP user"
           } else {
-            # If user exists, reset its password
             $u = Get-LocalUser -Name 'RDP'
             $u | Set-LocalUser -Password $securePass
           }
-
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-
-          # Export credentials to GitHub Actions env for later display in logs (short-lived)
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_CREDS=User: RDP | Password: $password"
-
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-            Write-Error "User creation failed"
-            exit 1
-          }
 
       - name: Install Tailscale
         shell: pwsh
@@ -75,21 +65,23 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Establish Tailscale Connection
+      - name: Establish Tailscale Connection (fixed auth handling)
         shell: pwsh
         run: |
-          if (-not $env:TAILSCALE_AUTH_KEY) { Write-Error "Set repo secret TAILSCALE_AUTH_KEY"; exit 1 }
           $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          & $exe up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="gh-runner-$($env:GITHUB_RUN_ID)" --accept-routes --accept-dns
+          $auth = $env:TAILSCALE_AUTH_KEY
+          if (-not $auth) {
+            Write-Error "Set repo secret TAILSCALE_AUTH_KEY"
+            exit 1
+          }
+          & $exe up --authkey="$auth" --hostname="gh-runner-$($env:GITHUB_RUN_ID)" --accept-routes --accept-dns
           Start-Sleep -Seconds 5
 
-          # Wait for a Tailscale IPv4 address
-          $tsIP = $null
-          $retries = 0
+          $tsIP = $null; $retries = 0
           while (-not $tsIP -and $retries -lt 20) {
             try { $tsIP = (& $exe ip -4).Trim() } catch { $tsIP = $null }
             if ($tsIP) { break }
-            Start-Sleep -Seconds 5
+            Start-Sleep -Seconds 3
             $retries++
           }
           if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
@@ -110,7 +102,7 @@ jobs:
         shell: pwsh
         run: |
           $hours = [int]$env:HOURS
-          if ($hours -lt 1) { $hours = 10 }    # fallback
+          if ($hours -lt 1) { $hours = 10 }
           Write-Host "Keeping RDP available for $hours hour(s)..."
           $end = (Get-Date).AddHours($hours)
           while ((Get-Date) -lt $end) {
@@ -120,23 +112,8 @@ jobs:
           }
 
           Write-Host "Requested time elapsed. Performing cleanup..."
-
-          # Cleanup: disable RDP, remove firewall rule, remove temp user, and bring down tailscale
-          try {
-            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1 -Type DWord -ErrorAction SilentlyContinue
-          } catch { Write-Warning "Could not set registry to disable RDP: $_" }
-
-          try {
-            netsh advfirewall firewall delete rule name="RDP-Tailscale" || $null
-          } catch { Write-Warning "Failed to delete firewall rule: $_" }
-
-          try {
-            if (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue) { Remove-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue }
-          } catch { Write-Warning "Failed to remove local user RDP: $_" }
-
-          try {
-            $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-            & $exe down
-          } catch { Write-Warning "Failed to bring down Tailscale: $_" }
-
+          try { Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1 -Type DWord -ErrorAction SilentlyContinue } catch {}
+          try { netsh advfirewall firewall delete rule name="RDP-Tailscale" || $null } catch {}
+          try { if (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue) { Remove-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue } } catch {}
+          try { $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"; & $exe down } catch {}
           Write-Host "Cleanup complete."
