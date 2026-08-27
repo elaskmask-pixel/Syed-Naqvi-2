@@ -65,14 +65,15 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Establish Tailscale Connection (fixed auth handling)
-        shell: pwsh
+      - name: Establish Tailscale Connection
         run: |
-          $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          $auth = $env:TAILSCALE_AUTH_KEY
-          if (-not $auth) {
-            Write-Error "Set repo secret TAILSCALE_AUTH_KEY"
-            exit 1
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip
           }
           & $exe up --authkey="$auth" --hostname="gh-runner-$($env:GITHUB_RUN_ID)" --accept-routes --accept-dns
           Start-Sleep -Seconds 5
