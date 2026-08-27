@@ -13,12 +13,12 @@ jobs:
     runs-on: windows-latest
     env:
       HOURS: ${{ github.event.inputs.hours }}
-      REMOTE_USER: 'Administrator'                       # default username
-      REMOTE_PASS: ${{ secrets.REMOTE_PASS }}           # required
-      TARGETS: ${{ secrets.TARGETS }}                   # comma-separated Tailscale IPs
-      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }} 
-      WINRM_USE_SSL: ${{ secrets.WINRM_USE_SSL }}       # optional: 'true' if using WinRM over HTTPS
-      WINRM_SKIPCERT: ${{ secrets.WINRM_SKIPCERT }}     # optional: 'true' to skip cert checks
+      REMOTE_USER: 'Administrator'
+      REMOTE_PASS: ${{ secrets.REMOTE_PASS }}
+      TARGETS: ${{ secrets.TARGETS }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      WINRM_USE_SSL: ${{ secrets.WINRM_USE_SSL }}
+      WINRM_SKIPCERT: ${{ secrets.WINRM_SKIPCERT }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -35,6 +35,97 @@ jobs:
         run: |
           if (-not $env:TAILSCALE_AUTHKEY) { throw "Set repo secret TAILSCALE_AUTHKEY" }
           tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname "gha-runner-${{ github.run_id }}" --accept-dns --accept-routes || tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname "gha-runner-${{ github.run_id }}" || throw "tailscale up failed"
+          Start-Sleep -Seconds 5
+          tailscale status
+
+      - name: Create EnableRDP script on runner
+        shell: pwsh
+        run: |
+          $script = @'
+param(
+    [int]$Hours = 10,
+    [string]$TaskName = "DisableRDP_Auto"
+)
+
+try {
+    Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Type DWord -ErrorAction Stop
+} catch {
+    Write-Warning "Registry set failed: $_"
+    throw
+}
+
+try {
+    Set-Service -Name TermService -StartupType Automatic -ErrorAction Stop
+    Start-Service -Name TermService -ErrorAction Stop
+} catch {
+    Write-Warning "TermService start failed: $_"
+}
+
+try {
+    Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop
+} catch {
+    if (-not (Get-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -Profile Any -ErrorAction Stop
+    } else {
+        Enable-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -ErrorAction SilentlyContinue
+    }
+}
+
+$disableCmd = "Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1; Get-NetFirewallRule -DisplayGroup 'Remote Desktop' | Disable-NetFirewallRule; if (Get-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' -ErrorAction SilentlyContinue) { Disable-NetFirewallRule -DisplayName 'Allow RDP TCP 3389' }"
+
+try {
+    $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -WindowStyle Hidden -Command `"${disableCmd}`""
+    $at = (Get-Date).AddHours($Hours)
+    $trigger = New-ScheduledTaskTrigger -Once -At $at
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue }
+    Register-ScheduledTask -TaskName $TaskName -Trigger $trigger -Action $action -RunLevel Highest -ErrorAction Stop
+} catch {
+    Write-Warning "Scheduling disable failed: $_"
+    $timeStr = $at.ToString("HH:mm")
+    $dateStr = $at.ToString("MM/dd/yyyy")
+    $cmd = "schtasks /Create /SC ONCE /TN `"$TaskName`" /TR `"powershell -NoProfile -WindowStyle Hidden -Command `"${disableCmd}`"`" /ST $timeStr /SD $dateStr /RL HIGHEST /F"
+    Invoke-Expression $cmd
+}
+
+Write-Output "RDP enabled for $Hours hour(s)."
+'@
+
+          Set-Content -Path EnableRDP_10h.ps1 -Value $script -Force -Encoding UTF8
+
+      - name: Run EnableRDP_10h on each target via WinRM over Tailscale
+        shell: pwsh
+        env:
+          HOURS: ${{ env.HOURS }}
+          TARGETS: ${{ env.TARGETS }}
+          REMOTE_PASS: ${{ env.REMOTE_PASS }}
+          WINRM_USE_SSL: ${{ env.WINRM_USE_SSL }}
+          WINRM_SKIPCERT: ${{ env.WINRM_SKIPCERT }}
+        run: |
+          if (-not $env:TARGETS) { throw "Set repo secret TARGETS" }
+          $targets = ($env:TARGETS -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+          $securePass = ConvertTo-SecureString $env:REMOTE_PASS -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential ('Administrator', $securePass)
+
+          $so = $null
+          if ($env:WINRM_SKIPCERT -eq 'true') { $so = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck -OperationTimeout 180000 }
+
+          foreach ($t in $targets) {
+            Write-Output "Processing $t"
+            try {
+              if ($so) {
+                $s = New-PSSession -ComputerName $t -Credential $cred -UseSSL ($env:WINRM_USE_SSL -eq 'true') -SessionOption $so -ErrorAction Stop
+              } else {
+                if ($env:WINRM_USE_SSL -eq 'true') { $s = New-PSSession -ComputerName $t -Credential $cred -UseSSL -ErrorAction Stop } else { $s = New-PSSession -ComputerName $t -Credential $cred -ErrorAction Stop }
+              }
+              Copy-Item -ToSession $s -Path .\EnableRDP_10h.ps1 -Destination "C:\Windows\Temp\EnableRDP_10h.ps1" -Force -ErrorAction Stop
+              Invoke-Command -Session $s -ScriptBlock { param($p,$h) & $p $h } -ArgumentList "C:\Windows\Temp\EnableRDP_10h.ps1", $env:HOURS -ErrorAction Stop
+              Invoke-Command -Session $s -ScriptBlock { Remove-Item -Path "C:\Windows\Temp\EnableRDP_10h.ps1" -ErrorAction SilentlyContinue }
+              Remove-PSSession -Session $s
+              Write-Output "Success for $t"
+            } catch {
+              Write-Warning "Failed for $t : $_"
+            }
+          }          tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname "gha-runner-${{ github.run_id }}" --accept-dns --accept-routes || tailscale up --authkey="$env:TAILSCALE_AUTHKEY" --hostname "gha-runner-${{ github.run_id }}" || throw "tailscale up failed"
           Start-Sleep -Seconds 5
           tailscale status
 
