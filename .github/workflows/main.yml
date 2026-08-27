@@ -1,4 +1,4 @@
-name: Enable RDP on Windows targets via Tailscale (default 10 hours)
+name: RDP
 
 on:
   workflow_dispatch:
